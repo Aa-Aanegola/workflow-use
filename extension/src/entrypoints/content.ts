@@ -3,340 +3,221 @@ import { EventType, IncrementalSource } from "@rrweb/types";
 
 let stopRecording: (() => void) | undefined = undefined;
 let isRecordingActive = true;
-let scrollTimeout: ReturnType<typeof setTimeout> | null = null;
-let lastScrollY: number | null = null;
-let lastDirection: "up" | "down" | null = null;
-const DEBOUNCE_MS = 500;
 
-const SAFE_ATTRIBUTES = new Set([
-  "id",
-  "name",
-  "type",
-  "placeholder",
-  "aria-label",
-  "aria-labelledby",
-  "aria-describedby",
-  "role",
-  "for",
-  "autocomplete",
-  "required",
-  "readonly",
-  "alt",
-  "title",
-  "src",
-  "href",
-  "target",
-  "data-id",
-  "data-qa",
-  "data-cy",
-  "data-testid",
-]);
-
-function getXPath(element: HTMLElement): string {
-  if (element.id !== "") {
-    return `id("${element.id}")`;
-  }
-  if (element === document.body) {
-    return element.tagName.toLowerCase();
-  }
+function getXPath(element: HTMLElement | null): string {
+  if (!element) return "unknown";
+  if (!element.tagName) return "unknown";
+  if (element.id) return `id("${element.id}")`;
+  if (element === document.body) return element.tagName.toLowerCase();
   let ix = 0;
   const siblings = element.parentNode?.children;
   if (siblings) {
     for (let i = 0; i < siblings.length; i++) {
-      const sibling = siblings[i];
-      if (sibling === element) {
+      if (siblings[i] === element) {
         return `${getXPath(element.parentElement as HTMLElement)}/${element.tagName.toLowerCase()}[${ix + 1}]`;
       }
-      if (sibling.nodeType === 1 && sibling.tagName === element.tagName) {
-        ix++;
-      }
+      if (siblings[i].nodeType === 1 && siblings[i].tagName === element.tagName) ix++;
     }
   }
   return element.tagName.toLowerCase();
 }
 
-function getEnhancedCSSSelector(element: HTMLElement, xpath: string): string {
-  let cssSelector = element.tagName.toLowerCase();
+function getEnhancedCSSSelector(element: HTMLElement | null, xpath: string): string {
+  if (!element || !element.tagName) return "unknown";
+  let selector = element.tagName.toLowerCase();
   if (element.classList && element.classList.length > 0) {
-    const validClassPattern = /^[a-zA-Z_][a-zA-Z0-9_-]*$/;
-    element.classList.forEach((className) => {
-      if (className && validClassPattern.test(className)) {
-        cssSelector += `.${CSS.escape(className)}`;
-      }
+    element.classList.forEach(className => {
+      if (className) selector += `.${CSS.escape(className)}`;
     });
   }
   for (const attr of element.attributes) {
-    const attrName = attr.name;
-    const attrValue = attr.value;
-    if (attrName === "class") continue;
-    if (!attrName.trim()) continue;
-    if (!SAFE_ATTRIBUTES.has(attrName)) continue;
-    const safeAttribute = CSS.escape(attrName);
-    if (attrValue === "") {
-      cssSelector += `[${safeAttribute}]`;
-    } else {
-      const safeValue = attrValue.replace(/"/g, '\"');
-      if (/['"<>`\s]/.test(attrValue)) {
-        cssSelector += `[${safeAttribute}*="${safeValue}"]`;
-      } else {
-        cssSelector += `[${safeAttribute}="${safeValue}"]`;
-      }
+    if (attr.name !== "class" && attr.value) {
+      selector += `[${CSS.escape(attr.name)}="${CSS.escape(attr.value)}"]`;
     }
   }
-  return cssSelector;
+  return selector;
 }
 
-function attachListenersToNode(node: Node | ShadowRoot) {
-  node.addEventListener("click", handleCustomClick, true);
-  node.addEventListener("input", handleInput, true);
-  node.addEventListener("change", handleSelectChange, true);
-  node.addEventListener("keydown", handleKeydown, true);
-  node.addEventListener("mouseover", handleMouseOver, true);
-  node.addEventListener("mouseout", handleMouseOut, true);
-  node.addEventListener("focus", handleFocus, true);
-  node.addEventListener("blur", handleBlur, true);
-  node.querySelectorAll("*").forEach((el) => {
-    if ((el as HTMLElement).shadowRoot) {
-      attachListenersToNode((el as HTMLElement).shadowRoot!);
+function findEditableElement(root: HTMLElement | ShadowRoot): HTMLElement | null {
+  try {
+    const el = root.querySelector("input, textarea, [contenteditable]");
+    console.log("findEditableElement in", root, "found:", el);
+    return el;
+  } catch (e) {
+    console.error("Error in findEditableElement:", e);
+    return null;
+  }
+}
+
+function resolveClickTarget(event: Event): HTMLElement | null {
+  let target = event.target as HTMLElement | null;
+  console.log("resolveClickTarget called with", target);
+  return target;
+}
+
+function resolveInputTarget(event: Event): HTMLElement | null {
+  try {
+    let target = event.target as HTMLElement | null;
+    console.log("resolveInputTarget called with", target);
+    if (!target) return null;
+    if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.hasAttribute("contenteditable")) {
+      console.log("Direct editable target detected:", target);
+      return target;
     }
-  });
-}
-
-function observeShadowDOM() {
-  const observer = new MutationObserver((mutations) => {
-    mutations.forEach((mutation) => {
-      mutation.addedNodes.forEach((node) => {
-        if (node instanceof HTMLElement && node.shadowRoot) {
-          attachListenersToNode(node.shadowRoot);
+    if (target.shadowRoot) {
+      const deep = findEditableElement(target.shadowRoot);
+      if (deep) {
+        console.log("Found editable in shadowRoot:", deep);
+        return deep;
+      }
+    }
+    let parent = target.parentElement;
+    while (parent) {
+      if (parent.shadowRoot) {
+        const deep = findEditableElement(parent.shadowRoot);
+        if (deep) {
+          console.log("Found editable in parent shadowRoot:", deep);
+          return deep;
         }
-      });
-    });
-  });
-  observer.observe(document, { childList: true, subtree: true });
+      }
+      parent = parent.parentElement;
+    }
+    const fallback = findEditableElement(document);
+    console.log("Fallback editable element:", fallback);
+    return fallback;
+  } catch (e) {
+    console.error("Error in resolveInputTarget:", e);
+    return null;
+  }
 }
 
 function startRecorder() {
-  if (stopRecording) {
-    return;
-  }
+  if (stopRecording) return;
+  console.log("Starting recorder");
   isRecordingActive = true;
   stopRecording = rrweb.record({
     emit(event) {
       if (!isRecordingActive) return;
-      if (event.type === EventType.IncrementalSnapshot && event.data.source === IncrementalSource.Scroll) {
-        const scrollData = event.data as { id: number; x: number; y: number };
-        const roundedScrollData = {
-          ...scrollData,
-          x: Math.round(scrollData.x),
-          y: Math.round(scrollData.y),
-        };
-        let currentDirection: "up" | "down" | null = null;
-        if (lastScrollY !== null) {
-          currentDirection = scrollData.y > lastScrollY ? "down" : "up";
-        }
-        if (lastDirection !== null && currentDirection !== null && currentDirection !== lastDirection) {
-          if (scrollTimeout) {
-            clearTimeout(scrollTimeout);
-            scrollTimeout = null;
-          }
-          chrome.runtime.sendMessage({
-            type: "RRWEB_EVENT",
-            payload: { ...event, data: roundedScrollData },
-          });
-          lastDirection = currentDirection;
-          lastScrollY = scrollData.y;
-          return;
-        }
-        lastDirection = currentDirection;
-        lastScrollY = scrollData.y;
-        if (scrollTimeout) {
-          clearTimeout(scrollTimeout);
-        }
-        scrollTimeout = setTimeout(() => {
-          chrome.runtime.sendMessage({
-            type: "RRWEB_EVENT",
-            payload: { ...event, data: roundedScrollData },
-          });
-          scrollTimeout = null;
-          lastDirection = null;
-        }, DEBOUNCE_MS);
-      } else {
-        chrome.runtime.sendMessage({ type: "RRWEB_EVENT", payload: event });
-      }
+      console.log("rrweb emit event:", event);
+      chrome.runtime.sendMessage({ type: "RRWEB_EVENT", payload: event });
     },
-    maskInputOptions: {
-      password: true,
-    },
+    maskInputOptions: { password: true },
     checkoutEveryNms: 10000,
     checkoutEveryNth: 200,
     recordShadowDOM: true,
   });
-  attachListenersToNode(document);
-  observeShadowDOM();
+  attachListeners(document);
 }
 
 function stopRecorder() {
   if (stopRecording) {
+    console.log("Stopping recorder");
     stopRecording();
     stopRecording = undefined;
     isRecordingActive = false;
   }
 }
 
+function attachListeners(root: Document | ShadowRoot) {
+  console.log("Attaching listeners to:", root);
+  root.addEventListener("click", handleCustomClick, true);
+  root.addEventListener("input", handleInput, true);
+  root.addEventListener("change", handleSelectChange, true);
+  root.addEventListener("keydown", handleKeydown, true);
+}
+
 function handleCustomClick(event: MouseEvent) {
   if (!isRecordingActive) return;
-  const targetElement = event.composedPath()[0] as HTMLElement;
-  if (!targetElement) return;
-  try {
-    const xpath = getXPath(targetElement);
-    const clickData = {
+  console.log("handleCustomClick fired for:", event);
+  const target = resolveClickTarget(event);
+  if (!target) return;
+  chrome.runtime.sendMessage({
+    type: "CUSTOM_CLICK_EVENT",
+    payload: {
       timestamp: Date.now(),
-      url: document.location.href,
-      frameUrl: window.location.href,
-      xpath: xpath,
-      cssSelector: getEnhancedCSSSelector(targetElement, xpath),
-      elementTag: targetElement.tagName,
-      elementText: targetElement.textContent?.trim().slice(0, 200) || "",
-    };
-    chrome.runtime.sendMessage({
-      type: "CUSTOM_CLICK_EVENT",
-      payload: clickData,
-    });
-  } catch (error) {}
+      url: location.href,
+      frameUrl: location.href,
+      xpath: getXPath(target),
+      cssSelector: getEnhancedCSSSelector(target, getXPath(target)),
+      elementTag: target.tagName,
+      elementText: target.textContent?.trim().slice(0, 200) || "",
+    },
+  });
 }
 
 function handleInput(event: Event) {
   if (!isRecordingActive) return;
-  const targetElement = event.composedPath()[0] as HTMLInputElement | HTMLTextAreaElement;
-  if (!targetElement || !("value" in targetElement)) return;
-  const isPassword = targetElement.type === "password";
-  try {
-    const xpath = getXPath(targetElement);
-    const inputData = {
+  console.log("handleInput fired for:", event);
+  const target = resolveInputTarget(event) as HTMLInputElement | HTMLTextAreaElement;
+  if (!target || !("value" in target)) return;
+  chrome.runtime.sendMessage({
+    type: "CUSTOM_INPUT_EVENT",
+    payload: {
       timestamp: Date.now(),
-      url: document.location.href,
-      frameUrl: window.location.href,
-      xpath: xpath,
-      cssSelector: getEnhancedCSSSelector(targetElement, xpath),
-      elementTag: targetElement.tagName,
-      value: isPassword ? "********" : targetElement.value,
-    };
-    chrome.runtime.sendMessage({
-      type: "CUSTOM_INPUT_EVENT",
-      payload: inputData,
-    });
-  } catch (error) {}
+      url: location.href,
+      frameUrl: location.href,
+      xpath: getXPath(target),
+      cssSelector: getEnhancedCSSSelector(target, getXPath(target)),
+      elementTag: target.tagName,
+      value: target.type === "password" ? "********" : target.value,
+    },
+  });
 }
 
 function handleSelectChange(event: Event) {
   if (!isRecordingActive) return;
-  const targetElement = event.composedPath()[0] as HTMLSelectElement;
-  if (!targetElement || targetElement.tagName !== "SELECT") return;
-  try {
-    const xpath = getXPath(targetElement);
-    const selectedOption = targetElement.options[targetElement.selectedIndex];
-    const selectData = {
+  console.log("handleSelectChange fired for:", event);
+  const target = resolveInputTarget(event) as HTMLSelectElement;
+  if (!target) return;
+  chrome.runtime.sendMessage({
+    type: "CUSTOM_SELECT_EVENT",
+    payload: {
       timestamp: Date.now(),
-      url: document.location.href,
-      frameUrl: window.location.href,
-      xpath: xpath,
-      cssSelector: getEnhancedCSSSelector(targetElement, xpath),
-      elementTag: targetElement.tagName,
-      selectedValue: targetElement.value,
-      selectedText: selectedOption ? selectedOption.text : "",
-    };
-    chrome.runtime.sendMessage({
-      type: "CUSTOM_SELECT_EVENT",
-      payload: selectData,
-    });
-  } catch (error) {}
+      url: location.href,
+      frameUrl: location.href,
+      xpath: getXPath(target),
+      cssSelector: getEnhancedCSSSelector(target, getXPath(target)),
+      elementTag: target.tagName,
+      selectedValue: target.value,
+      selectedText: target.selectedOptions[0]?.text || "",
+    },
+  });
 }
-
-const CAPTURED_KEYS = new Set([
-  "Enter",
-  "Tab",
-  "Escape",
-  "ArrowUp",
-  "ArrowDown",
-  "ArrowLeft",
-  "ArrowRight",
-  "Home",
-  "End",
-  "PageUp",
-  "PageDown",
-  "Backspace",
-  "Delete",
-]);
 
 function handleKeydown(event: KeyboardEvent) {
   if (!isRecordingActive) return;
-  const key = event.key;
-  let keyToLog = "";
-  if (CAPTURED_KEYS.has(key)) {
-    keyToLog = key;
-  } else if ((event.ctrlKey || event.metaKey) && key.length === 1 && /[a-zA-Z0-9]/.test(key)) {
-    keyToLog = `CmdOrCtrl+${key.toUpperCase()}`;
-  }
-  if (keyToLog) {
-    const targetElement = event.composedPath()[0] as HTMLElement;
-    let xpath = "";
-    let cssSelector = "";
-    let elementTag = "document";
-    if (targetElement && typeof targetElement.tagName === "string") {
-      try {
-        xpath = getXPath(targetElement);
-        cssSelector = getEnhancedCSSSelector(targetElement, xpath);
-        elementTag = targetElement.tagName;
-      } catch (e) {}
-    }
-    try {
-      const keyData = {
-        timestamp: Date.now(),
-        url: document.location.href,
-        frameUrl: window.location.href,
-        key: keyToLog,
-        xpath: xpath,
-        cssSelector: cssSelector,
-        elementTag: elementTag,
-      };
-      chrome.runtime.sendMessage({
-        type: "CUSTOM_KEY_EVENT",
-        payload: keyData,
-      });
-    } catch (error) {}
-  }
+  console.log("handleKeydown fired for:", event);
+  const target = resolveInputTarget(event);
+  if (!target) return;
+  chrome.runtime.sendMessage({
+    type: "CUSTOM_KEY_EVENT",
+    payload: {
+      timestamp: Date.now(),
+      url: location.href,
+      frameUrl: location.href,
+      xpath: getXPath(target),
+      cssSelector: getEnhancedCSSSelector(target, getXPath(target)),
+      elementTag: target.tagName,
+      key: event.key,
+    },
+  });
 }
-
-function handleMouseOver(event: MouseEvent) {}
-function handleMouseOut(event: MouseEvent) {}
-function handleFocus(event: FocusEvent) {}
-function handleBlur(event: FocusEvent) {}
 
 export default defineContentScript({
   matches: ["<all_urls>"],
-  main(ctx) {
-    chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  main() {
+    console.log("Content script loaded");
+    chrome.runtime.onMessage.addListener((message) => {
+      console.log("Received message:", message);
       if (message.type === "SET_RECORDING_STATUS") {
-        const shouldBeRecording = message.payload;
-        if (shouldBeRecording && !isRecordingActive) {
-          startRecorder();
-        } else if (!shouldBeRecording && isRecordingActive) {
-          stopRecorder();
-        }
+        if (message.payload && !isRecordingActive) startRecorder();
+        else if (!message.payload && isRecordingActive) stopRecorder();
       }
     });
-    chrome.runtime.sendMessage(
-      { type: "REQUEST_RECORDING_STATUS" },
-      (response) => {
-        if (response && response.isRecordingEnabled) {
-          startRecorder();
-        } else {
-          stopRecorder();
-        }
-      }
-    );
-    window.addEventListener("beforeunload", () => {
-      stopRecorder();
+    chrome.runtime.sendMessage({ type: "REQUEST_RECORDING_STATUS" }, (response) => {
+      console.log("Initial recording status response:", response);
+      if (response?.isRecordingEnabled) startRecorder();
     });
+    window.addEventListener("beforeunload", stopRecorder);
   },
 });
